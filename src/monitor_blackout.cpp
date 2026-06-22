@@ -32,6 +32,7 @@
 #define IDLE_THRESHOLD_MS    2000
 #define HOTPLUG_TIMER_MS     5000
 #define HOLDREVEAL_TIMER_MS  80
+#define HOLD_THRESHOLD_MS    300
 
 // Colors
 #define COLOR_WIDGET_BG      RGB(25, 25, 25)
@@ -45,7 +46,7 @@
 #define COLOR_STATUS_CLEAR   RGB(50, 200, 50)
 
 // Dimensions
-#define WIDGET_WIDTH         400
+#define WIDGET_WIDTH         460
 #define WIDGET_HEADER_H      32
 #define WIDGET_ROW_HEIGHT    40
 #define WIDGET_PADDING       10
@@ -94,6 +95,7 @@ struct MonitorInfo {
     MonitorMode mode;
     ULONGLONG clearedTime;
     UINT32 targetId;
+    bool fgDetection;
 };
 
 // Saved state for hotplug restoration
@@ -117,6 +119,10 @@ static std::vector<UINT32> g_lastTargetIds;
 static POINT g_lastCursorPos = {};
 static ULONGLONG g_lastCursorMoveTime = 0;
 
+// Hold-to-reveal state
+static bool g_hotkeyHeld[9] = {};
+static ULONGLONG g_holdStartTime[9] = {};
+
 // Widget state
 static bool g_closeHovered = false;
 static bool g_dragging = false;
@@ -127,7 +133,7 @@ static RECT g_dragStartRect = {};
 struct ButtonRect {
     RECT rc;
     int monitorIndex;
-    int buttonType; // 0=toggle, 1=mode
+    int buttonType; // 0=toggle, 1=mode, 2=fgDetection
 };
 static std::vector<ButtonRect> g_buttonRects;
 static RECT g_closeButtonRect = {};
@@ -253,6 +259,7 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM) {
     info.mode = MonitorMode::Manual;
     info.clearedTime = GetTickCount64();
     info.targetId = GetTargetIdForMonitor(mi.szDevice);
+    info.fgDetection = true;
 
     g_monitors.push_back(info);
     return TRUE;
@@ -370,7 +377,7 @@ static void ApplyModeLogic() {
 
         bool cursorOnMonitor = PtInRect(&mon.rcMonitor, cursorPos) != 0;
         bool fgWindowOnMonitor = (hFgMonitor != NULL && hFgMonitor == mon.hMonitor);
-        bool activityDetected = cursorOnMonitor || fgWindowOnMonitor;
+        bool activityDetected = cursorOnMonitor || (fgWindowOnMonitor && mon.fgDetection);
 
         if (mon.state == OverlayState::VisibleBlack) {
             if (activityDetected) {
@@ -423,22 +430,49 @@ static void CheckHoldReveal() {
     for (int i = 0; i < (int)g_monitors.size() && i < 9; i++) {
         MonitorInfo& mon = g_monitors[i];
         bool numHeld = (GetAsyncKeyState('1' + i) & 0x8000) != 0;
+        bool keysDown = ctrlHeld && numHeld;
 
-        if (ctrlHeld && numHeld) {
+        if (keysDown && !g_hotkeyHeld[i]) {
+            // Key just pressed - start hold
+            g_hotkeyHeld[i] = true;
+            g_holdStartTime[i] = GetTickCount64();
             if (mon.state == OverlayState::VisibleBlack) {
                 ShowWindow(mon.hWndOverlay, SW_HIDE);
                 mon.state = OverlayState::TemporarilyRevealed;
                 UpdateWidgetUI();
             }
-        } else {
-            if (mon.state == OverlayState::TemporarilyRevealed) {
-                ShowWindow(mon.hWndOverlay, SW_SHOWNOACTIVATE);
-                SetWindowPos(mon.hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                mon.state = OverlayState::VisibleBlack;
-                UpdateWidgetUI();
+        } else if (!keysDown && g_hotkeyHeld[i]) {
+            // Key just released
+            g_hotkeyHeld[i] = false;
+            ULONGLONG holdDuration = GetTickCount64() - g_holdStartTime[i];
+
+            if (holdDuration < HOLD_THRESHOLD_MS) {
+                // Quick tap - treat as permanent toggle
+                if (mon.state == OverlayState::TemporarilyRevealed) {
+                    // Was blacked, tapped to clear -> make it permanently cleared
+                    mon.state = OverlayState::Cleared;
+                    mon.clearedTime = GetTickCount64();
+                    UpdateWidgetUI();
+                } else if (mon.state == OverlayState::Cleared) {
+                    // Was clear, tap to black
+                    ShowWindow(mon.hWndOverlay, SW_SHOWNOACTIVATE);
+                    SetWindowPos(mon.hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    mon.state = OverlayState::VisibleBlack;
+                    UpdateWidgetUI();
+                }
+            } else {
+                // Long hold released - restore black
+                if (mon.state == OverlayState::TemporarilyRevealed) {
+                    ShowWindow(mon.hWndOverlay, SW_SHOWNOACTIVATE);
+                    SetWindowPos(mon.hWndOverlay, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    mon.state = OverlayState::VisibleBlack;
+                    UpdateWidgetUI();
+                }
             }
         }
+        // If keysDown && g_hotkeyHeld[i]: already held, do nothing (no flicker)
     }
 }
 
@@ -680,8 +714,28 @@ static LRESULT CALLBACK WidgetWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             DeleteObject(mbBrush);
             DrawTextW(hdcMem, ModeToString(mon.mode), -1, &btnMode, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
+            // Window Detection button
+            int btnX3 = DpiScale(295);
+            RECT btnWD = { btnX3, btnY1, btnX3 + DpiScale(WIDGET_BTN_W), btnY1 + DpiScale(WIDGET_BTN_H) };
+
+            ButtonRect br3;
+            br3.rc = btnWD;
+            br3.monitorIndex = i;
+            br3.buttonType = 2;
+            int btn3Idx = (int)g_buttonRects.size();
+            g_buttonRects.push_back(br3);
+
+            bool btn3Hovered = (g_hoveredButtonIdx == btn3Idx);
+            HBRUSH wdBrush = CreateSolidBrush(btn3Hovered ? COLOR_WIDGET_BTN_HVR : COLOR_WIDGET_BTN);
+            FillRect(hdcMem, &btnWD, wdBrush);
+            DeleteObject(wdBrush);
+            const wchar_t* wdStr = mon.fgDetection ? L"WD:On" : L"WD:Off";
+            COLORREF oldTextColor = SetTextColor(hdcMem, mon.fgDetection ? COLOR_STATUS_CLEAR : COLOR_STATUS_BLACK);
+            DrawTextW(hdcMem, wdStr, -1, &btnWD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(hdcMem, oldTextColor);
+
             // Status text
-            int statusX = DpiScale(295);
+            int statusX = DpiScale(370);
             RECT statusRect = { statusX, rowY, rc.right - DpiScale(WIDGET_PADDING), rowY + DpiScale(WIDGET_ROW_HEIGHT) };
             if (mon.state == OverlayState::VisibleBlack || mon.state == OverlayState::TemporarilyRevealed) {
                 SetTextColor(hdcMem, COLOR_STATUS_BLACK);
@@ -730,8 +784,14 @@ static LRESULT CALLBACK WidgetWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             if (PtInRect(&g_buttonRects[i].rc, pt)) {
                 if (g_buttonRects[i].buttonType == 0) {
                     ToggleMonitor(g_buttonRects[i].monitorIndex);
-                } else {
+                } else if (g_buttonRects[i].buttonType == 1) {
                     CycleMode(g_buttonRects[i].monitorIndex);
+                } else if (g_buttonRects[i].buttonType == 2) {
+                    int idx = g_buttonRects[i].monitorIndex;
+                    if (idx >= 0 && idx < (int)g_monitors.size()) {
+                        g_monitors[idx].fgDetection = !g_monitors[idx].fgDetection;
+                        UpdateWidgetUI();
+                    }
                 }
                 return 0;
             }
@@ -930,6 +990,12 @@ static void RescanMonitors() {
         }
     }
 
+    // Reset hold-reveal state
+    for (int i = 0; i < 9; i++) {
+        g_hotkeyHeld[i] = false;
+        g_holdStartTime[i] = 0;
+    }
+
     CreateOverlays();
     RegisterHotkeys();
     GetDisplayConfigTargetIds(g_lastTargetIds);
@@ -997,7 +1063,7 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == HOTKEY_TOGGLE_ALL) {
             ToggleAll();
         } else if (wParam >= (WPARAM)HOTKEY_TOGGLE_BASE && wParam < (WPARAM)(HOTKEY_TOGGLE_BASE + 9)) {
-            ToggleMonitor((int)(wParam - HOTKEY_TOGGLE_BASE));
+            // Handled by CheckHoldReveal() polling - do nothing here to avoid flicker
         } else if (wParam == HOTKEY_CYCLE_ALL) {
             CycleAllModes();
         } else if (wParam >= (WPARAM)HOTKEY_CYCLE_BASE && wParam < (WPARAM)(HOTKEY_CYCLE_BASE + 9)) {
