@@ -44,9 +44,12 @@
 #define COLOR_CLOSE_HOVER    RGB(200, 50, 50)
 #define COLOR_STATUS_BLACK   RGB(220, 50, 50)
 #define COLOR_STATUS_CLEAR   RGB(50, 200, 50)
+#define COLOR_CHECKBOX_BG    RGB(40, 40, 40)
+#define COLOR_CHECKBOX_BORDER RGB(120, 120, 120)
+#define COLOR_CHECKBOX_CHECK RGB(80, 200, 80)
 
 // Dimensions
-#define WIDGET_WIDTH         460
+#define WIDGET_WIDTH         520
 #define WIDGET_HEADER_H      32
 #define WIDGET_ROW_HEIGHT    40
 #define WIDGET_PADDING       10
@@ -54,6 +57,7 @@
 #define WIDGET_BTN_H         26
 #define WIDGET_CORNER_RAD    10
 #define CLOSE_BTN_SIZE       24
+#define CHECKBOX_SIZE        16
 
 // Hotkey IDs
 #define HOTKEY_TOGGLE_ALL    1000
@@ -95,13 +99,16 @@ struct MonitorInfo {
     MonitorMode mode;
     ULONGLONG clearedTime;
     UINT32 targetId;
-    bool fgDetection;
+    bool detectWindow;
+    bool detectMouse;
 };
 
 // Saved state for hotplug restoration
 struct SavedMonitorState {
     OverlayState state;
     MonitorMode mode;
+    bool detectWindow;
+    bool detectMouse;
 };
 
 // Globals
@@ -115,6 +122,7 @@ static bool g_widgetVisible = false;
 static HANDLE g_hMutex = NULL;
 static HFONT g_hFont = NULL;
 static HFONT g_hFontBold = NULL;
+static HFONT g_hFontSmall = NULL;
 static std::vector<UINT32> g_lastTargetIds;
 static POINT g_lastCursorPos = {};
 static ULONGLONG g_lastCursorMoveTime = 0;
@@ -133,7 +141,7 @@ static RECT g_dragStartRect = {};
 struct ButtonRect {
     RECT rc;
     int monitorIndex;
-    int buttonType; // 0=toggle, 1=mode, 2=fgDetection
+    int buttonType; // 0=toggle, 1=mode, 2=checkboxWindow, 3=checkboxMouse
 };
 static std::vector<ButtonRect> g_buttonRects;
 static RECT g_closeButtonRect = {};
@@ -173,6 +181,7 @@ static UINT32 GetTargetIdForMonitor(const wchar_t* deviceName);
 static void CreateWidgetWindow();
 static void CreateFonts();
 static void DestroyFonts();
+static HMONITOR GetMonitorForWindow(HWND hWnd);
 
 // IsOurWindow helper
 static bool IsOurWindow(HWND hWnd) {
@@ -183,6 +192,24 @@ static bool IsOurWindow(HWND hWnd) {
         if (hWnd == g_monitors[i].hWndOverlay) return true;
     }
     return false;
+}
+
+// Reliable monitor detection for a window: uses MonitorFromWindow first,
+// then falls back to checking if the window's RECT intersects monitor rects
+static HMONITOR GetMonitorForWindow(HWND hWnd) {
+    if (!hWnd || !IsWindow(hWnd)) return NULL;
+
+    // Primary method: MonitorFromWindow
+    HMONITOR hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONULL);
+    if (hMon) return hMon;
+
+    // Fallback: get window rect and find which monitor it overlaps most
+    RECT wr = {};
+    if (!GetWindowRect(hWnd, &wr)) return NULL;
+
+    // Use MonitorFromRect as fallback
+    hMon = MonitorFromRect(&wr, MONITOR_DEFAULTTONULL);
+    return hMon;
 }
 
 // DPI scaling helper
@@ -200,11 +227,14 @@ static void CreateFonts() {
         DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     g_hFontBold = CreateFontW(-DpiScale(13), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    g_hFontSmall = CreateFontW(-DpiScale(11), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
 }
 
 static void DestroyFonts() {
     if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
     if (g_hFontBold) { DeleteObject(g_hFontBold); g_hFontBold = NULL; }
+    if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = NULL; }
 }
 
 // DISPLAYCONFIG target ID lookup
@@ -259,7 +289,8 @@ static BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM) {
     info.mode = MonitorMode::Manual;
     info.clearedTime = GetTickCount64();
     info.targetId = GetTargetIdForMonitor(mi.szDevice);
-    info.fgDetection = true;
+    info.detectWindow = true;
+    info.detectMouse = true;
 
     g_monitors.push_back(info);
     return TRUE;
@@ -362,32 +393,70 @@ static void ApplyModeLogic() {
     POINT cursorPos;
     GetCursorPos(&cursorPos);
 
+    // Get foreground window and determine which monitor it's on
     HWND hFgWnd = GetForegroundWindow();
-    if (IsOurWindow(hFgWnd)) {
+
+    // Skip if it's null or one of our own windows
+    if (hFgWnd != NULL && IsOurWindow(hFgWnd)) {
         hFgWnd = NULL;
+    }
+
+    // Also skip if the window is not visible or is minimized
+    if (hFgWnd != NULL) {
+        if (!IsWindowVisible(hFgWnd) || IsIconic(hFgWnd)) {
+            hFgWnd = NULL;
+        }
     }
 
     HMONITOR hFgMonitor = NULL;
     if (hFgWnd != NULL) {
-        hFgMonitor = MonitorFromWindow(hFgWnd, MONITOR_DEFAULTTONULL);
+        // Use our robust monitor detection that tries MonitorFromWindow first,
+        // then falls back to MonitorFromRect with the window's actual rectangle
+        hFgMonitor = GetMonitorForWindow(hFgWnd);
     }
 
     for (int i = 0; i < (int)g_monitors.size(); i++) {
         MonitorInfo& mon = g_monitors[i];
 
         bool cursorOnMonitor = PtInRect(&mon.rcMonitor, cursorPos) != 0;
+
+        // Determine if foreground window is on this monitor
+        // Primary check: compare HMONITOR handles
         bool fgWindowOnMonitor = (hFgMonitor != NULL && hFgMonitor == mon.hMonitor);
-        bool activityDetected = cursorOnMonitor || (fgWindowOnMonitor && mon.fgDetection);
+
+        // Fallback check: if MonitorFromWindow returned a valid monitor but handle
+        // comparison failed (can happen with stale handles after hotplug), check
+        // if the window rect actually intersects this monitor's rect
+        if (!fgWindowOnMonitor && hFgWnd != NULL && hFgMonitor == NULL) {
+            RECT wr = {};
+            if (GetWindowRect(hFgWnd, &wr)) {
+                RECT intersection = {};
+                if (IntersectRect(&intersection, &wr, &mon.rcMonitor)) {
+                    // Check if a significant portion of the window is on this monitor
+                    int intersectArea = (intersection.right - intersection.left) * (intersection.bottom - intersection.top);
+                    int windowArea = (wr.right - wr.left) * (wr.bottom - wr.top);
+                    if (windowArea > 0 && intersectArea > windowArea / 4) {
+                        fgWindowOnMonitor = true;
+                    }
+                }
+            }
+        }
+
+        // Activity that can TRIGGER clearing (respects detection flags)
+        bool clearingActivity = (mon.detectMouse && cursorOnMonitor) || (mon.detectWindow && fgWindowOnMonitor);
+
+        // Activity that PREVENTS re-blacking (always considers both)
+        bool sustainingActivity = cursorOnMonitor || fgWindowOnMonitor;
 
         if (mon.state == OverlayState::VisibleBlack) {
-            if (activityDetected) {
+            if (clearingActivity) {
                 ShowWindow(mon.hWndOverlay, SW_HIDE);
                 mon.state = OverlayState::Cleared;
                 mon.clearedTime = GetTickCount64();
                 UpdateWidgetUI();
             }
         } else if (mon.state == OverlayState::Cleared) {
-            if (!activityDetected) {
+            if (!sustainingActivity) {
                 switch (mon.mode) {
                     case MonitorMode::Manual:
                         // Never re-black automatically
@@ -546,6 +615,38 @@ static void UpdateWidgetUI() {
 static int GetWidgetHeight() {
     int rows = (int)g_monitors.size();
     return DpiScale(WIDGET_HEADER_H + rows * WIDGET_ROW_HEIGHT + WIDGET_ROW_HEIGHT + WIDGET_PADDING);
+}
+
+// Draw a custom checkbox
+static void DrawCheckbox(HDC hdc, RECT rc, bool checked, bool hovered) {
+    // Draw border
+    HPEN hPen = CreatePen(PS_SOLID, 1, hovered ? COLOR_WIDGET_TEXT : COLOR_CHECKBOX_BORDER);
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+    HBRUSH hBrush = CreateSolidBrush(COLOR_CHECKBOX_BG);
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBrush);
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, hOldBrush);
+    DeleteObject(hBrush);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+    if (checked) {
+        // Draw checkmark
+        HPEN hCheckPen = CreatePen(PS_SOLID, DpiScale(2), COLOR_CHECKBOX_CHECK);
+        HPEN hOldPen2 = (HPEN)SelectObject(hdc, hCheckPen);
+
+        int cx = (rc.left + rc.right) / 2;
+        int cy = (rc.top + rc.bottom) / 2;
+        int sz = (rc.right - rc.left) / 4;
+
+        // Checkmark: two lines forming a check shape
+        MoveToEx(hdc, cx - sz, cy, NULL);
+        LineTo(hdc, cx - sz / 3, cy + sz);
+        LineTo(hdc, cx + sz, cy - sz);
+
+        SelectObject(hdc, hOldPen2);
+        DeleteObject(hCheckPen);
+    }
 }
 
 // Create widget window
@@ -714,35 +815,59 @@ static LRESULT CALLBACK WidgetWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             DeleteObject(mbBrush);
             DrawTextW(hdcMem, ModeToString(mon.mode), -1, &btnMode, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-            // Window Detection button
-            int btnX3 = DpiScale(295);
-            RECT btnWD = { btnX3, btnY1, btnX3 + DpiScale(WIDGET_BTN_W), btnY1 + DpiScale(WIDGET_BTN_H) };
+            // Checkbox: Window detection
+            int cbSize = DpiScale(CHECKBOX_SIZE);
+            int cbX1 = DpiScale(300);
+            int cbY = rowY + (DpiScale(WIDGET_ROW_HEIGHT) - cbSize) / 2;
+            RECT cbWin = { cbX1, cbY, cbX1 + cbSize, cbY + cbSize };
 
             ButtonRect br3;
-            br3.rc = btnWD;
+            br3.rc = { cbX1 - DpiScale(2), cbY - DpiScale(2), cbX1 + cbSize + DpiScale(30), cbY + cbSize + DpiScale(2) };
             br3.monitorIndex = i;
-            br3.buttonType = 2;
+            br3.buttonType = 2; // checkboxWindow
             int btn3Idx = (int)g_buttonRects.size();
             g_buttonRects.push_back(br3);
 
             bool btn3Hovered = (g_hoveredButtonIdx == btn3Idx);
-            HBRUSH wdBrush = CreateSolidBrush(btn3Hovered ? COLOR_WIDGET_BTN_HVR : COLOR_WIDGET_BTN);
-            FillRect(hdcMem, &btnWD, wdBrush);
-            DeleteObject(wdBrush);
-            const wchar_t* wdStr = mon.fgDetection ? L"WD:On" : L"WD:Off";
-            COLORREF oldTextColor = SetTextColor(hdcMem, mon.fgDetection ? COLOR_STATUS_CLEAR : COLOR_STATUS_BLACK);
-            DrawTextW(hdcMem, wdStr, -1, &btnWD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SetTextColor(hdcMem, oldTextColor);
+            DrawCheckbox(hdcMem, cbWin, mon.detectWindow, btn3Hovered);
+
+            // Label "Win" next to checkbox
+            HFONT hPrevFont = (HFONT)SelectObject(hdcMem, g_hFontSmall);
+            RECT cbWinLabel = { cbX1 + cbSize + DpiScale(3), rowY, cbX1 + cbSize + DpiScale(32), rowY + DpiScale(WIDGET_ROW_HEIGHT) };
+            SetTextColor(hdcMem, mon.detectWindow ? COLOR_STATUS_CLEAR : RGB(140, 140, 140));
+            DrawTextW(hdcMem, L"Win", -1, &cbWinLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            // Checkbox: Mouse detection
+            int cbX2 = DpiScale(380);
+            RECT cbMouse = { cbX2, cbY, cbX2 + cbSize, cbY + cbSize };
+
+            ButtonRect br4;
+            br4.rc = { cbX2 - DpiScale(2), cbY - DpiScale(2), cbX2 + cbSize + DpiScale(42), cbY + cbSize + DpiScale(2) };
+            br4.monitorIndex = i;
+            br4.buttonType = 3; // checkboxMouse
+            int btn4Idx = (int)g_buttonRects.size();
+            g_buttonRects.push_back(br4);
+
+            bool btn4Hovered = (g_hoveredButtonIdx == btn4Idx);
+            DrawCheckbox(hdcMem, cbMouse, mon.detectMouse, btn4Hovered);
+
+            // Label "Mouse" next to checkbox
+            RECT cbMouseLabel = { cbX2 + cbSize + DpiScale(3), rowY, cbX2 + cbSize + DpiScale(42), rowY + DpiScale(WIDGET_ROW_HEIGHT) };
+            SetTextColor(hdcMem, mon.detectMouse ? COLOR_STATUS_CLEAR : RGB(140, 140, 140));
+            DrawTextW(hdcMem, L"Mouse", -1, &cbMouseLabel, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(hdcMem, hPrevFont);
 
             // Status text
-            int statusX = DpiScale(370);
+            SetTextColor(hdcMem, COLOR_WIDGET_TEXT);
+            int statusX = DpiScale(450);
             RECT statusRect = { statusX, rowY, rc.right - DpiScale(WIDGET_PADDING), rowY + DpiScale(WIDGET_ROW_HEIGHT) };
             if (mon.state == OverlayState::VisibleBlack || mon.state == OverlayState::TemporarilyRevealed) {
                 SetTextColor(hdcMem, COLOR_STATUS_BLACK);
-                DrawTextW(hdcMem, L"[BLACKED]", -1, &statusRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(hdcMem, L"[BLK]", -1, &statusRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             } else {
                 SetTextColor(hdcMem, COLOR_STATUS_CLEAR);
-                DrawTextW(hdcMem, L"[CLEAR]", -1, &statusRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(hdcMem, L"[CLR]", -1, &statusRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             }
             SetTextColor(hdcMem, COLOR_WIDGET_TEXT);
         }
@@ -787,9 +912,17 @@ static LRESULT CALLBACK WidgetWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 } else if (g_buttonRects[i].buttonType == 1) {
                     CycleMode(g_buttonRects[i].monitorIndex);
                 } else if (g_buttonRects[i].buttonType == 2) {
+                    // Toggle window detection checkbox
                     int idx = g_buttonRects[i].monitorIndex;
                     if (idx >= 0 && idx < (int)g_monitors.size()) {
-                        g_monitors[idx].fgDetection = !g_monitors[idx].fgDetection;
+                        g_monitors[idx].detectWindow = !g_monitors[idx].detectWindow;
+                        UpdateWidgetUI();
+                    }
+                } else if (g_buttonRects[i].buttonType == 3) {
+                    // Toggle mouse detection checkbox
+                    int idx = g_buttonRects[i].monitorIndex;
+                    if (idx >= 0 && idx < (int)g_monitors.size()) {
+                        g_monitors[idx].detectMouse = !g_monitors[idx].detectMouse;
                         UpdateWidgetUI();
                     }
                 }
@@ -968,6 +1101,8 @@ static void RescanMonitors() {
             SavedMonitorState ss;
             ss.state = g_monitors[i].state;
             ss.mode = g_monitors[i].mode;
+            ss.detectWindow = g_monitors[i].detectWindow;
+            ss.detectMouse = g_monitors[i].detectMouse;
             savedStates[g_monitors[i].targetId] = ss;
         }
     }
@@ -983,6 +1118,8 @@ static void RescanMonitors() {
             if (it != savedStates.end()) {
                 g_monitors[i].state = it->second.state;
                 g_monitors[i].mode = it->second.mode;
+                g_monitors[i].detectWindow = it->second.detectWindow;
+                g_monitors[i].detectMouse = it->second.detectMouse;
                 if (g_monitors[i].state == OverlayState::Cleared) {
                     g_monitors[i].clearedTime = GetTickCount64();
                 }
