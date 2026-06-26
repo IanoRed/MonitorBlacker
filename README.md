@@ -16,15 +16,19 @@ Lightweight native Win32 utility that blacks out monitors with fullscreen overla
 ## Features
 
 - Three modes: Manual (toggle only), Auto (re-blacks after 5 minutes of inactivity), Forced (re-blacks after 1 second)
-- Cursor-aware: overlay clears automatically when the mouse enters a blacked monitor
-- Foreground-aware: overlay clears when a window is focused on that monitor
-- Dark-themed floating widget with per-monitor toggle and mode buttons
+- Per-monitor detection checkboxes: independently enable or disable cursor detection and foreground window detection for each display
+- Cursor-aware: overlay clears automatically when the mouse enters a blacked monitor (when enabled)
+- Foreground-aware: overlay clears when a window is focused on that monitor (when enabled)
+- Hold-to-reveal: in Forced mode, hold Ctrl+N to temporarily peek at display N; release to re-black
+- Dark-themed floating widget with per-monitor toggle, mode buttons, and detection checkboxes
+- Rescan button to force monitor re-enumeration
 - System tray integration with right-click menu
 - Global hotkeys
 - DPI-aware (scales on 125%, 150%, 200% etc.)
 - Adaptive polling (250ms active, 1000ms idle)
-- Monitor hot-plug detection via DISPLAYCONFIG
+- Monitor hot-plug detection via DISPLAYCONFIG target IDs
 - Single-instance enforcement via named mutex
+- Graceful shutdown handling (never blocks Windows restart/logoff)
 - All monitors supported including primary (primary defaults to Manual + Cleared)
 
 ## Hotkeys
@@ -32,7 +36,7 @@ Lightweight native Win32 utility that blacks out monitors with fullscreen overla
 | Hotkey | Action |
 |---|---|
 | Ctrl+0 | Toggle all monitors (homogenize state) |
-| Ctrl+1..9 | Toggle display N |
+| Ctrl+1..9 | Toggle display N (quick tap toggles, long hold peeks in Forced mode) |
 | Ctrl+Alt+B | Cycle all monitors mode (Manual, Auto, Forced) |
 | Ctrl+Alt+1..9 | Cycle mode for display N |
 
@@ -44,20 +48,33 @@ Lightweight native Win32 utility that blacks out monitors with fullscreen overla
 | Auto | Clears on activity, re-blacks after 5 minutes of no activity on that monitor. |
 | Forced | Clears on activity, re-blacks after 1 second. Hold-to-reveal supported. |
 
+## Widget
+
+The floating widget provides per-monitor controls:
+
+- **Toggle button** (Clear/Black): immediately toggles the overlay state
+- **Mode button** (Manual/Auto/Forced): cycles through modes
+- **Win checkbox**: when checked, foreground windows on that monitor trigger de-blacking
+- **Mouse checkbox**: when checked, cursor entering that monitor triggers de-blacking
+- **Rescan Monitors button**: forces re-enumeration of connected displays
+
+The widget starts hidden. Double-click the tray icon or right-click and select "Show Widget" to open it.
+
 ## Architecture
 
-Monitor Blackout is implemented as a compact, single-file Win32 C++ application (approximately 1200 lines) built around a simple event-driven state machine per monitor.
+Monitor Blackout is implemented as a compact, single-file Win32 C++ application built around a simple event-driven state machine per monitor.
 
-- **Single-file Win32 C++ application (~1200 lines)**
 - **Entry point:** `wWinMain` creates a message-only window for hotkeys, timers, and tray icon messages
 - **Overlays:** per-monitor `WS_POPUP | WS_EX_LAYERED | WS_EX_TOPMOST` fullscreen black windows
-- **Polling:** `WM_TIMER` drives `ApplyModeLogic()` which checks cursor position and foreground window
-- **Widget:** owner-drawn `WS_POPUP` with dark theme, `BS_OWNERDRAW` buttons, custom close button, draggable header
-- **Hotplug:** periodic `DISPLAYCONFIG` enumeration detects monitor connect/disconnect
+- **Polling:** `WM_TIMER` drives `ApplyModeLogic()` which checks cursor position and foreground window against per-monitor detection flags
+- **Widget:** owner-drawn `WS_POPUP` with dark theme, custom-painted buttons and checkboxes, draggable header
+- **Hotplug:** periodic `DISPLAYCONFIG` enumeration compares target ID sets to detect monitor connect/disconnect
 - **State machine:** each monitor has an `OverlayState` enum (`VisibleBlack`, `TemporarilyRevealed`, `Cleared`) for clean transitions
+- **Hold-to-reveal:** `GetAsyncKeyState` polling (80ms interval) detects key hold vs. quick tap for non-flickering peek behavior
 - **DPI:** `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` with scaled widget dimensions
-- **Tray:** `NOTIFYICONDATA` with custom icon loaded from embedded resource
-- **Cleanup:** all GDI objects, hooks, hotkeys, timers properly freed on exit
+- **Tray:** `NOTIFYICONDATA` with custom icon loaded from embedded resource; handles `TaskbarCreated` message for Explorer crash recovery
+- **Shutdown:** handles `WM_QUERYENDSESSION` and `WM_ENDSESSION` to never block Windows shutdown
+- **Cleanup:** all GDI objects, hotkeys, timers, and mutex properly freed on exit
 
 ## Folder Structure
 
@@ -75,7 +92,7 @@ monitor-blackout/
 
 ## Download and Run
 
-- Download `monitor_blackout.exe` from the root of this repository
+- Download `monitor_blackout.exe` from the root of this repository.
 - Double-click to run. No installation, no dependencies, no admin rights required.
 - The application appears as a system tray icon. Right-click for options, double-click to show/hide widget.
 
@@ -83,7 +100,7 @@ monitor-blackout/
 
 To have Monitor Blackout start automatically every time Windows boots:
 
-1. Press Win+R to open the Run dialog
+1. Press `Win+R` to open the Run dialog
 2. Type `shell:startup` and press Enter
 3. Create a shortcut to `monitor_blackout.exe` in the folder that opens
 
