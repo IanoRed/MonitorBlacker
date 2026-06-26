@@ -446,7 +446,7 @@ static void ApplyModeLogic() {
         bool clearingActivity = (mon.detectMouse && cursorOnMonitor) || (mon.detectWindow && fgWindowOnMonitor);
 
         // Activity that PREVENTS re-blacking (always considers both)
-        bool sustainingActivity = cursorOnMonitor || fgWindowOnMonitor;
+        bool sustainingActivity = (mon.detectMouse && cursorOnMonitor) || (mon.detectWindow && fgWindowOnMonitor);
 
         if (mon.state == OverlayState::VisibleBlack) {
             if (clearingActivity) {
@@ -1234,6 +1234,21 @@ static LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_DISPLAYCHANGE:
         PostMessageW(hWnd, WM_RESCAN, 0, 0);
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wParam) {
+            Cleanup();
+            PostQuitMessage(0);
+        }
+        return 0;
+
+    case WM_CLOSE:
+        Cleanup();
+        PostQuitMessage(0);
         return 0;
 
     case WM_DESTROY:
